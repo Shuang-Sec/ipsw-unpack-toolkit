@@ -1,0 +1,19 @@
+# 解包产物（体积大，不入库）
+work/
+dsc_*/
+*.dmg
+*.dmg.aea
+out_*/
+ipswtmp/
+tmp/
+
+# 编译产物
+src/lzbitmap/zbm
+*.o
+
+# Python
+__pycache__/
+*.pyc
+
+# 日志
+*.log
