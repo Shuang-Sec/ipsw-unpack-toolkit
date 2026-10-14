@@ -1,0 +1,68 @@
+#!/bin/bash
+# 伪 apfs-fuse —— 在未安装 apfs-fuse 的环境中，让 ipsw 仍能解包 APFS 分卷。
+#
+# 原理
+#   ipsw 支持用环境变量 IPSW_APFS_FUSE_PATH 指定替代的"挂载器"，调用形式为
+#       <本脚本> <dmg 路径> <挂载点>
+#   本脚本不真正挂载 APFS，而是用 7-Zip 直接解出所需内容。好处：
+#     - 不需要 root、不需要 FUSE 内核支持
+#     - 只解目标目录，跳过整卷：约 3.8 GB → 约 520 MB
+#     - 解完立即删除源 dmg，磁盘峰值占用低
+#
+# 用法（由 ipsw 自动调用，一般无需手工执行）
+#   DSC_DEST=/path/to/out SEVEN_ZIP=7zz IPSW_APFS_FUSE_PATH=./fake-apfs-fuse \
+#     ipsw extract --dyld --dyld-arch arm64e --remote <IPSW_URL> -o ./tmp
+#
+# 环境变量
+#   DSC_DEST        必填，解出内容的目标目录
+#   SEVEN_ZIP       7-Zip 可执行文件（默认 7zz；需 21.02+ 才有 APFS 支持）
+#   APFS_FUSE_LOG   日志路径（默认 <DSC_DEST>/../apfs-unpack.log）
+#   DSC_FULL        设为 1 则解出全部子缓存（默认只解主缓存/atlas/dylddata + WebKit 子缓存）
+#   KEEP_DMG        设为 1 则保留源 dmg（默认解完即删）
+set -u
+
+DMG="${1:?用法: fake-apfs-fuse <dmg 路径> <挂载点>}"
+MNT="${2:-}"
+Z="${SEVEN_ZIP:-7zz}"
+DEST="${DSC_DEST:?请设置 DSC_DEST 为解包目标目录}"
+LOG="${APFS_FUSE_LOG:-$(dirname "$DEST")/apfs-unpack.log}"
+D="System/Library/Caches/com.apple.dyld"
+
+mkdir -p "$DEST" "$MNT" 2>/dev/null
+echo "=== $(date -Is) $(basename "$DMG") $(stat -c %s "$DMG" 2>/dev/null) 字节" >> "$LOG"
+
+if ! "$Z" l "$DMG" 2>/dev/null | grep -q 'com.apple.dyld/dyld_shared_cache'; then
+  echo "  该分卷不含 dyld shared cache，跳过" >> "$LOG"; exit 0
+fi
+
+# ---------- 解包 ----------
+if [ "${DSC_FULL:-0}" = "1" ]; then
+  echo "  全量解包（所有子缓存）" >> "$LOG"
+  "$Z" x "$DMG" -o"$DEST" "$D/dyld_shared_cache_arm64e*" -y >>"$LOG" 2>&1
+else
+  echo "  解包 主缓存 / atlas / dylddata" >> "$LOG"
+  "$Z" x "$DMG" -o"$DEST" "$D/dyld_shared_cache_arm64e" "$D/dyld_shared_cache_arm64e.atlas" \
+      "$D/*.dylddata" -y >>"$LOG" 2>&1
+
+  # dyld 会把体积大的框架拆进独立的数字子缓存。逐个流式扫描，
+  # 命中 WebCore/JavaScriptCore 字样的即为 WebKit 所在的那个。
+  for f in $("$Z" l "$DMG" 2>/dev/null | awk '/com\.apple\.dyld\/dyld_shared_cache_arm64e\.[0-9]+$/ {print $NF}'); do
+    if "$Z" x -so "$DMG" "$f" 2>/dev/null | grep -qaE 'WebCore|JavaScriptCore'; then
+      echo "  WebKit 子缓存 = $(basename "$f")，解包" >> "$LOG"
+      "$Z" x "$DMG" -o"$DEST" "$f" -y >>"$LOG" 2>&1
+      break
+    fi
+  done
+fi
+
+# ---------- 透明压缩修复 ----------
+# 以 decmpfs 压缩存储的文件，7-Zip 解出来是 0 字节，需另行解压。详见 docs/03-lzbitmap.md
+if [ -x "${ZBM_BIN:-zbm}" ] || command -v "${ZBM_BIN:-zbm}" >/dev/null 2>&1; then
+  python3 "$(dirname "$0")/decmpfs_fix.py" "$DEST/$D" >>"$LOG" 2>&1
+else
+  echo "  未找到 zbm，跳透明压缩修复（若出现 0 字节文件请先编译 src/lzbitmap）" >> "$LOG"
+fi
+
+echo "  解出 $(ls "$DEST/$D" 2>/dev/null | wc -l) 个文件" >> "$LOG"
+[ "${KEEP_DMG:-0}" = "1" ] || rm -f "$DMG" "$DMG.aea" 2>/dev/null
+exit 0

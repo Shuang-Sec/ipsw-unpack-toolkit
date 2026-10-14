@@ -1,0 +1,27 @@
+# 组合列表示例 —— 每行 "<机型标识> <build>"
+#
+# 机型标识：https://api.ipsw.me/v4/devices
+# build 号：https://api.ipsw.me/v4/device/<机型标识>?type=ipsw
+#
+# 以 # 开头的行会被忽略；也可以用 `机型 build # 备注` 的形式加注释。
+
+# iPhone 12 系列
+iPhone12,1 22E240
+iPhone12,8 22E240
+
+# iPhone 13 系列
+iPhone13,1 22E240
+iPhone13,2 23G90
+
+# iPhone 14 / 15 系列
+iPhone14,8 23G90
+iPhone15,2 23G90
+
+# iPhone 16 / 17 系列
+iPhone16,1 24A446
+iPhone17,5 24A446
+
+# 说明：
+#   - 同一 build 下不同机型的 dyld 缓存内容通常高度一致，调试时挑一个即可
+#   - 只想验证流程是否跑通，建议只留第一行，跑完约 2~5 分钟
+#   - 完整跑几十个组合时，注意磁盘至少留 10 GB
