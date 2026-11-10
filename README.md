@@ -1,43 +1,144 @@
 # ipsw-unpack-toolkit
 
-从 Apple **公开** IPSW 固件中解包 dyld shared cache 的工具集。
-全程离线可用，**不需要真机、不需要越狱、不需要开发者账号**。
+**English** | [简体中文](README.zh-CN.md)
 
-重点解决两件实际卡人的事：
+Unpack the `dyld_shared_cache` out of a public Apple IPSW — no jailbreak, no physical device,
+no developer account.
 
-1. **没有 apfs-fuse 也能解包** —— 用 `IPSW_APFS_FUSE_PATH` 注入伪挂载器，让 7-Zip 代替真挂载，
-   并把解包量从 3.8 GB 压到约 520 MB
-2. **7-Zip 解不出的透明压缩** —— APFS `decmpfs` 的 **LZBitmap（type 14）没有公开规范**，
-   上游工具一律报 `Unsupported Method` 并留下 0 字节文件；本仓库提供零依赖的 C 实现
+This is a small, focused toolkit built around three concrete problems that break the usual
+extraction pipeline. Each is documented below with the symptom, the root cause, and how this
+repo works around it.
 
 ---
 
-## 快速开始
+## What this solves
+
+### Problem 1 — APFS unpacking fails without `apfs-fuse`
+
+**Symptom**
+
+```
+$ ipsw extract --dyld --remote <IPSW_URL> -o out/
+[!] failed to find apfs-fuse
+```
+
+Nothing is extracted. `ipsw` has already decrypted the image, but it cannot read the
+filesystem inside without a mounter.
+
+**Root cause**
+
+`ipsw` shells out to `apfs-fuse` to mount the APFS volume. That binary is awkward to depend on:
+
+- it needs the FUSE kernel module, which containers and CI runners usually lack;
+- it links against an old `libcrypto` and frequently fails to build on current distros;
+- mounting a volume requires root.
+
+**Fix**
+
+`ipsw` accepts an `IPSW_APFS_FUSE_PATH` override for the mounter. `src/fake-apfs-fuse`
+uses that hook: instead of mounting anything, it hands 7-Zip an include list and extracts
+**only** the files under `System/Library/Caches/com.apple.dyld/`.
+
+Two benefits beyond "it runs":
+
+| | Full mount | This toolkit |
+| :--- | ---: | ---: |
+| APFS content unpacked | ~3.8 GB | ~520 MB |
+| Root required | yes | no |
+| FUSE required | yes | no |
+
+The intermediate image is deleted right after extraction, so peak disk usage stays near 5 GB.
+
+---
+
+### Problem 2 — files unpack to 0 bytes
+
+**Symptom**
+
+```
+dyld_shared_cache_arm64e.35.dylddata      0 bytes
+```
+
+7-Zip reports `ERROR: Unsupported Method` and leaves an empty file. The file is present and
+correctly named, so downstream parsers fail with confusing "no data" errors instead of an
+obvious decompression failure.
+
+**Root cause**
+
+Some files on APFS are stored with **transparent compression** (`decmpfs`): the payload lives
+in `<file>:com.apple.ResourceFork`, with a small header in `<file>:com.apple.decmpfs`.
+
+Compression type **14 = `CMP_RSRC_LZBITMAP`** has **no public specification**. Neither 7-Zip
+nor any mainstream archive library implements it, so the file silently comes out empty.
+
+On some device models the `.dylddata` segment — which holds the string pool and constant
+arrays — is stored exactly this way. Skip this step and you get files that exist but contain
+nothing.
+
+**Fix**
+
+`src/lzbitmap/` is a dependency-free C implementation of the LZBitmap decompressor
+(`libzbitmap.c`, ~1,200 lines) plus a CLI (`zbm`). `src/decmpfs_fix.py` scans an unpacked
+directory, finds zero-byte files that carry decmpfs attributes, and reconstructs them.
+
+> **The trap that costs the most time here**: `zbm_decompress()` returns **0 on success** —
+> negative values are error codes. Writing `if (ret > 0)` marks *every block* as a failure,
+> and since 0 also looks like "no bytes written", the error path gives no useful signal.
+> Full write-up: [docs/03-lzbitmap.md](docs/03-lzbitmap.md).
+
+---
+
+### Problem 3 — long batch runs fall over
+
+**Symptom**
+
+Running a few hundred device/version combinations unattended, something always breaks:
+a network hiccup, an `ipsw` process that hangs at 0% CPU, or the disk filling up.
+
+**Fix**
+
+`src/batch_unpack.sh` adds four guards around the single-combination script:
+
+| Guard | How |
+| :--- | :--- |
+| **Resume** | Checks for **artifacts on disk**, not a completion list |
+| **Retry** | Up to 2 attempts per combination, with temp cleanup between |
+| **Hang guard** | `timeout` around the extraction step |
+| **Disk guard** | Cleans temp dirs when free space drops below a threshold |
+
+The resume rule is deliberate. An earlier version recorded completion in a state file, and
+a bug meant the artifact was never moved into place — **the log said "done" while the output
+directory was empty**. Deciding on the artifact itself makes that class of bug impossible.
+Details: [docs/04-batch-pipeline.md](docs/04-batch-pipeline.md).
+
+---
+
+## Quick start
 
 ```bash
 git clone https://github.com/Shuang-Sec/ipsw-unpack-toolkit.git
 cd ipsw-unpack-toolkit
 
-# 1) 编译 LZBitmap 解压工具（零依赖，只需 C 编译器）
+# 1) Build the LZBitmap decompressor (pure C, no dependencies)
 make -C src/lzbitmap
 export PATH="$PWD/src/lzbitmap:$PATH"
 
-# 2) 解包一个版本（以 iPhone 14 Pro / iOS 26.6.2 为例）
+# 2) Unpack one firmware version (iPhone 14 Pro / iOS 26.6.2 here)
 ./src/run_ipsw_unpack.sh iPhone15,2 23G90 ./work
 ```
 
-跑完会得到：
+Result:
 
 ```
 work/dsc_iPhone15_2__23G90/System/Library/Caches/com.apple.dyld/
-├── dyld_shared_cache_arm64e            主缓存
-├── dyld_shared_cache_arm64e.atlas      索引
-├── dyld_shared_cache_arm64e.01.dylddata  数据段
-├── dyld_shared_cache_arm64e.<N>        大框架的独立子缓存
+├── dyld_shared_cache_arm64e              main cache
+├── dyld_shared_cache_arm64e.atlas        index
+├── dyld_shared_cache_arm64e.01.dylddata  data segment (string pool, constants)
+├── dyld_shared_cache_arm64e.<N>          split sub-caches for large frameworks
 └── ⋮
 ```
 
-批量跑：
+Batch mode:
 
 ```bash
 ./src/batch_unpack.sh examples/devices.txt ./work
@@ -45,119 +146,79 @@ work/dsc_iPhone15_2__23G90/System/Library/Caches/com.apple.dyld/
 
 ---
 
-## 仓库结构
+## Repository layout
 
 ```
 ├── docs/
-│   ├── 01-ipsw-fetch.md        IPSW 获取与 AEA1/WKMS 解密
-│   ├── 02-apfs-unpack.md       无 apfs-fuse 环境下的解包方案
-│   ├── 03-lzbitmap.md          ★ decmpfs type 14 格式与实现（核心）
-│   └── 04-batch-pipeline.md    批量长跑的工程实践
+│   ├── 01-ipsw-fetch.md        fetching and decrypting an IPSW (AEA1/WKMS)
+│   ├── 02-apfs-unpack.md       unpacking APFS without apfs-fuse
+│   ├── 03-lzbitmap.md          ★ decmpfs type 14: format and implementation
+│   └── 04-batch-pipeline.md    engineering notes for long batch runs
 ├── src/
-│   ├── lzbitmap/               ★ LZBitmap 解压库与 CLI（纯 C，零依赖）
+│   ├── lzbitmap/               ★ LZBitmap decompressor (pure C, no dependencies)
 │   │   ├── libzbitmap.c/.h
 │   │   ├── zbm.c
 │   │   └── Makefile
-│   ├── decmpfs_fix.py          批量扫描并修复 0 字节的透明压缩文件
-│   ├── fake-apfs-fuse          伪挂载器（供 ipsw 调用）
-│   ├── run_ipsw_unpack.sh      单版本：查地址 → 提取 → 解包 → 修复
-│   └── batch_unpack.sh         批量：断点续跑 / 重试 / 超时 / 磁盘保护
-├── examples/devices.txt        组合列表示例
-└── tools/PUT_TOOLS_HERE.md     外部依赖获取说明
+│   ├── decmpfs_fix.py          batch repair of zero-byte compressed files
+│   ├── fake-apfs-fuse          pseudo-mounter invoked by ipsw
+│   ├── run_ipsw_unpack.sh      single combination
+│   └── batch_unpack.sh         batch driver with the four guards
+├── examples/devices.txt        combination list example
+└── tools/PUT_TOOLS_HERE.md     how to obtain the external dependencies
 ```
 
 ---
 
-## 三个技术要点
+## Requirements
 
-### 1. LZBitmap 独立实现
-
-APFS 的透明压缩属性 `decmpfs` 有一系列压缩类型，其中 **type 14 = `CMP_RSRC_LZBITMAP`**
-没有公开规范。7-Zip 会报 `Unsupported Method` 并把文件留成 0 字节 —— 这很隐蔽：
-文件在、名字对，内容却是空的，后续解析只会得到莫名其妙的结果。
-
-`src/lzbitmap/` 是一个零依赖的纯 C 实现。**实现时最容易踩的坑**：
-
-```c
-// 返回 0 表示成功，负值才是错误码 —— 与多数 C 库的习惯相反
-int zbm_decompress(void *dest, size_t dest_size,
-                   const void *src, size_t src_size, size_t *out_len);
-```
-
-写成 `if (ret > 0)` 会让每一块都被判为失败。细节见 [docs/03-lzbitmap.md](docs/03-lzbitmap.md)。
-
-### 2. 伪挂载器
-
-`ipsw` 通过 `IPSW_APFS_FUSE_PATH` 支持替换挂载器。本仓库的 `src/fake-apfs-fuse`
-不真正挂载 APFS，而是用 7-Zip 直接解出目标目录：
-
-- 不需要 root、不需要 FUSE 内核模块
-- 只解 dyld 目录，跳过整卷：**3.8 GB → 约 520 MB**
-- 解完立即删除源 dmg，磁盘峰值约 5 GB
-
-细节（含密封卷的坑）见 [docs/02-apfs-unpack.md](docs/02-apfs-unpack.md)。
-
-### 3. 批量长跑的鲁棒性
-
-跑几百个组合时，失败来自网络抖动、上游工具卡死、磁盘写满。
-`src/batch_unpack.sh` 内置四重保护：
-
-| 机制 | 说明 |
-| :--- | :--- |
-| 断点续跑 | 用**产物本身**判断，不用状态文件（避免"日志说完成、目录却是空的"） |
-| 失败重试 | 每个组合最多 2 次，中间清理临时目录 |
-| 卡死保护 | `timeout` 兜底，应对 ipsw 偶发无响应 |
-| 磁盘保护 | 剩余空间低于阈值时自动清理 |
-
-细节见 [docs/04-batch-pipeline.md](docs/04-batch-pipeline.md)。
-
----
-
-## 依赖
-
-| 依赖 | 版本 | 用途 | 获取 |
-| :--- | :--- | :--- | :--- |
-| `ipsw` | v3.1.x 实测 | 固件拉流、解密、调度挂载器 | [blacktop/ipsw](https://github.com/blacktop/ipsw) |
-| 7-Zip | **21.02+** | APFS 解包（旧版不支持 APFS） | [7-zip.org](https://www.7-zip.org/) |
-| `python3` | 3.8+ | `decmpfs_fix.py` | 系统自带 |
-| `curl` / `jq` | — | 查询固件下载地址 | 系统自带 |
-| C 编译器 | — | 编译 `zbm` | `gcc` / `clang` |
-
----
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
+| Dependency | Version | Purpose |
 | :--- | :--- | :--- |
-| `DSC_DEST` | — | **必填**，解包目标目录（由 `fake-apfs-fuse` 读取） |
-| `IPSW_BIN` | `ipsw` | ipsw 可执行文件路径 |
-| `SEVEN_ZIP` | `7zz` | 7-Zip 可执行文件路径 |
-| `ZBM_BIN` | `zbm` | LZBitmap 解压工具路径 |
-| `TIMEOUT_SEC` | `900` | 单次提取超时（秒） |
-| `DSC_FULL` | `0` | 设为 1 则解出全部子缓存（排查用） |
-| `KEEP_DMG` | `0` | 设为 1 则保留源 dmg |
-| `MIN_FREE_KB` | `7000000` | 批量模式的磁盘保护阈值 |
+| [`ipsw`](https://github.com/blacktop/ipsw) | v3.1.x tested | firmware streaming, decryption, mounter dispatch |
+| [7-Zip](https://www.7-zip.org/) | **21.02+** | APFS unpacking (older builds lack APFS support) |
+| `python3` | 3.8+ | `decmpfs_fix.py` (no third-party packages needed) |
+| `curl`, `jq` | — | resolving download URLs |
+| C compiler | — | building `zbm` |
+
+Setup notes: [`tools/PUT_TOOLS_HERE.md`](tools/PUT_TOOLS_HERE.md).
 
 ---
 
-## 已知问题与提示
+## Environment variables
 
-- **`ipsw` 报 `failed to find dyld_shared_cache(s) in DMG` 并保留 backing image** ——
-  使用替代挂载器时会出现，实际内容已解出，可忽略。
-- **不要把 `TMPDIR` 指向 `tmpfs`** —— 固件数 GB，会把内存写满并报 `EDQUOT`。
-  脚本已显式将 `TMPDIR` 指向工作盘。
-- **部分机型的 `.dylddata` 恒为 0 字节** —— 就是透明压缩，跑 `decmpfs_fix.py` 即可。
-  这也是本仓库存在的直接原因。
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `DSC_DEST` | — | **required**, unpack destination (read by `fake-apfs-fuse`) |
+| `IPSW_BIN` | `ipsw` | path to the `ipsw` binary |
+| `SEVEN_ZIP` | `7zz` | path to the 7-Zip binary |
+| `ZBM_BIN` | `zbm` | path to the LZBitmap decompressor |
+| `TIMEOUT_SEC` | `900` | per-extraction timeout |
+| `DSC_FULL` | `0` | set to 1 to unpack every sub-cache (for debugging) |
+| `KEEP_DMG` | `0` | set to 1 to keep the intermediate image |
+| `MIN_FREE_KB` | `7000000` | disk guard threshold in batch mode |
 
 ---
 
-## 说明
+## Known issues
 
-本项目仅使用 Apple 公开发布的固件与开源工具，用于固件格式研究与互操作性分析。
-相关格式知识（APFS、decmpfs、dyld shared cache）在 Apple 平台逆向社区中有公开讨论。
+- **`ipsw` prints `failed to find dyld_shared_cache(s) in DMG` and keeps a backing image** —
+  expected when a substitute mounter is used. The content has been extracted; the message is
+  noise.
+- **Never point `TMPDIR` at `tmpfs`.** Firmware images are several GB; this fills memory and
+  fails with `EDQUOT`. The scripts explicitly place `TMPDIR` on the work disk.
+- **Zero-byte `.dylddata` files** mean transparent compression — run `decmpfs_fix.py`. This is
+  the direct reason this repository exists.
 
-LZBitmap 的算法实现参考了 [blacktop/lzfse-cgo](https://github.com/blacktop/lzfse-cgo)，
-整理为独立可复用的 C 库。详见 [docs/03-lzbitmap.md](docs/03-lzbitmap.md)。
+---
+
+## Scope
+
+This project only uses firmware that Apple publishes publicly, together with open-source
+tools. It is intended for firmware format research and interoperability analysis. The file
+formats involved (APFS, decmpfs, dyld shared cache) are discussed openly in the Apple
+reverse-engineering community.
+
+The LZBitmap implementation is based on [blacktop/lzfse-cgo](https://github.com/blacktop/lzfse-cgo),
+repackaged as a standalone C library.
 
 ## License
 
